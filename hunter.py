@@ -151,11 +151,18 @@ async def scrape_lancers(browser) -> list[dict]:
 
     try:
         # ログイン
-        await page.goto("https://www.lancers.jp/user/login", timeout=30000)
-        await page.fill('input[name="data[User][email]"]', LANCERS_EMAIL)
-        await page.fill('input[name="data[User][password]"]', LANCERS_PASSWORD)
-        await page.click('button[type="submit"]')
-        await page.wait_for_load_state("networkidle", timeout=30000)
+        await page.goto("https://www.lancers.jp/user/login", timeout=60000)
+        await page.wait_for_selector(
+            'input[type="email"], input[name*="email"], input[id*="email"]',
+            timeout=30000
+        )
+        await page.fill(
+            'input[type="email"], input[name*="email"], input[id*="email"]',
+            LANCERS_EMAIL
+        )
+        await page.fill('input[type="password"]', LANCERS_PASSWORD)
+        await page.click('button[type="submit"], input[type="submit"], button:has-text("ログイン")')
+        await page.wait_for_load_state("networkidle", timeout=60000)
         print("  [Lancers] ログイン完了")
 
         for kw in KEYWORDS:
@@ -227,6 +234,7 @@ async def scrape_lancers(browser) -> list[dict]:
                 pass
 
     except Exception as e:
+        await page.screenshot(path="lancers_error.png")
         print(f"  [Lancers error] {e}")
     finally:
         await page.close()
@@ -244,11 +252,18 @@ async def scrape_crowdworks(browser) -> list[dict]:
 
     try:
         # ログイン
-        await page.goto("https://crowdworks.jp/login", timeout=30000)
-        await page.fill('input[name="session[email]"]', CW_EMAIL)
-        await page.fill('input[name="session[password]"]', CW_PASSWORD)
-        await page.click('input[type="submit"], button[type="submit"]')
-        await page.wait_for_load_state("networkidle", timeout=30000)
+        await page.goto("https://crowdworks.jp/login", timeout=60000)
+        await page.wait_for_selector(
+            'input[type="email"], input[name*="email"], input[id*="email"]',
+            timeout=30000
+        )
+        await page.fill(
+            'input[type="email"], input[name*="email"], input[id*="email"]',
+            CW_EMAIL
+        )
+        await page.fill('input[type="password"]', CW_PASSWORD)
+        await page.click('input[type="submit"], button[type="submit"], button:has-text("ログイン")')
+        await page.wait_for_load_state("networkidle", timeout=60000)
         print("  [CW] ログイン完了")
 
         for kw in KEYWORDS:
@@ -318,6 +333,7 @@ async def scrape_crowdworks(browser) -> list[dict]:
                 pass
 
     except Exception as e:
+        await page.screenshot(path="cw_error.png")
         print(f"  [CW error] {e}")
     finally:
         await page.close()
@@ -332,7 +348,10 @@ async def main():
     all_jobs: list[dict] = []
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True)
+        browser = await pw.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage"],
+        )
         lancers_jobs = await scrape_lancers(browser)
         cw_jobs      = await scrape_crowdworks(browser)
         await browser.close()
