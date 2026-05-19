@@ -149,11 +149,20 @@ async def notify(job: dict, ev: dict, client: httpx.AsyncClient):
 
 
 # ─── HTML フェッチ ─────────────────────────────────────────────────────
-async def fetch(client: httpx.AsyncClient, url: str) -> BeautifulSoup | None:
+async def fetch(client: httpx.AsyncClient, url: str, debug: bool = False) -> BeautifulSoup | None:
     try:
         r = await client.get(url, timeout=20)
+        if debug:
+            soup_tmp = BeautifulSoup(r.text, "lxml")
+            title = soup_tmp.find("title")
+            all_links = soup_tmp.find_all("a", href=True)
+            print(f"  [debug] status={r.status_code} title={title.text[:50] if title else 'N/A'}")
+            print(f"  [debug] 全リンク数={len(all_links)}")
+            hrefs = [a.get('href','') for a in all_links[:10]]
+            print(f"  [debug] hrefs例: {hrefs}")
         if r.status_code == 200:
             return BeautifulSoup(r.text, "lxml")
+        print(f"  [fetch] status={r.status_code} {url[:60]}")
     except Exception as e:
         print(f"  [fetch error] {url[:60]}: {e}")
     return None
@@ -181,12 +190,12 @@ def dedupe(jobs: list) -> list:
 # ─── Lancers スクレイピング ────────────────────────────────────────────
 async def scrape_lancers(client: httpx.AsyncClient) -> list[dict]:
     jobs = []
-    for kw in KEYWORDS:
+    for i, kw in enumerate(KEYWORDS):
         url = (
             f"https://www.lancers.jp/work/search"
             f"?open=1&sort=new&keyword={kw}&work_type[]=project"
         )
-        soup = await fetch(client, url)
+        soup = await fetch(client, url, debug=(i == 0))  # 最初の1件だけデバッグ
         if not soup:
             continue
 
@@ -228,12 +237,12 @@ async def scrape_lancers(client: httpx.AsyncClient) -> list[dict]:
 # ─── Crowdworks スクレイピング ─────────────────────────────────────────
 async def scrape_crowdworks(client: httpx.AsyncClient) -> list[dict]:
     jobs = []
-    for kw in KEYWORDS:
+    for i, kw in enumerate(KEYWORDS):
         url = (
             f"https://crowdworks.jp/public/jobs/search"
             f"?order=new_job&keep_search_form=true&keyword={kw}&job_type=fixed_work"
         )
-        soup = await fetch(client, url)
+        soup = await fetch(client, url, debug=(i == 0))  # 最初の1件だけデバッグ
         if not soup:
             continue
 
