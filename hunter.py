@@ -21,7 +21,14 @@ import httpx
 from bs4 import BeautifulSoup
 import google.generativeai as genai
 
-# ─── 環境変数 ──────────────────────────────────────────────────────────
+# ─── 環境変数（.env ファイルまたは環境変数から読み込み） ──────────────────
+_env_file = Path(__file__).parent / ".env"
+if _env_file.exists():
+    for _line in _env_file.read_text().splitlines():
+        if "=" in _line and not _line.startswith("#"):
+            _k, _v = _line.split("=", 1)
+            os.environ.setdefault(_k.strip(), _v.strip())
+
 DISCORD_WEBHOOK = os.environ["DISCORD_WEBHOOK_FREELANCE"]
 GEMINI_API_KEY  = os.environ["GEMINI_API_KEY"]
 
@@ -155,24 +162,21 @@ def dedupe(jobs: list) -> list:
 # GitHub Actions の IP は各プラットフォームで直接ブロックされる。
 # DuckDuckGo は DDG 自身がインデックス済みのページを返すため迂回可能。
 async def search_ddg(client: httpx.AsyncClient, query: str) -> list[str]:
-    """DuckDuckGo HTML 検索からURLリストを返す"""
+    """DuckDuckGo HTML 検索 (POST) からURLリストを返す"""
     urls = []
     try:
-        r = await client.get(
+        r = await client.post(
             "https://html.duckduckgo.com/html/",
-            params={"q": query},
+            data={"q": query},
+            headers={**HEADERS, "Content-Type": "application/x-www-form-urlencoded"},
             timeout=20,
         )
-        if r.status_code != 200:
+        if r.status_code not in (200, 202):
             return []
         soup = BeautifulSoup(r.text, "lxml")
-        for a in soup.select("a.result__url, a[href*='uddg=']"):
+        for a in soup.select(".result__title a"):
             href = a.get("href", "")
-            # DDG がリダイレクト URL でラップしている場合は展開
-            m = re.search(r"uddg=([^&]+)", href)
-            if m:
-                    href = urllib.parse.unquote(m.group(1))
-            if href.startswith("http"):
+            if href.startswith("http") and "duckduckgo.com" not in href:
                 urls.append(href)
     except Exception as e:
         print(f"  [DDG error] {e}")
@@ -233,7 +237,7 @@ async def scrape_crowdworks(client: httpx.AsyncClient) -> list[dict]:
     seen_urls: set[str] = set()
 
     for kw in KEYWORDS[:10]:
-        query = f"site:crowdworks.jp/public/jobs {kw} 固定報酬"
+        query = f"crowdworks.jp/public/jobs {kw} 固定報酬 開発"
         urls  = await search_ddg(client, query)
         await asyncio.sleep(0.5)
 
