@@ -2,7 +2,7 @@ name: Freelance Hunter
 
 on:
   schedule:
-    - cron: '0 * * * *'  # 毎時間
+    - cron: '0 * * * *'
   workflow_dispatch:
 
 jobs:
@@ -24,11 +24,6 @@ jobs:
 
       - name: Install dependencies
         run: pip install -r requirements.txt
-
-      - name: Install Playwright browser
-        run: |
-          sudo apt-get install -y libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libasound2t64
-          playwright install chromium
 
       - name: Run hunter
         env:

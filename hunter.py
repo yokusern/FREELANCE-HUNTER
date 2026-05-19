@@ -14,10 +14,11 @@ import os
 import re
 from pathlib import Path
 
+import urllib.parse
+
 import feedparser
 import httpx
 from bs4 import BeautifulSoup
-from playwright.async_api import async_playwright
 import google.generativeai as genai
 
 # ─── 環境変数 ──────────────────────────────────────────────────────────
@@ -150,118 +151,126 @@ def dedupe(jobs: list) -> list:
     return out
 
 
-# ─── Lancers: RSS フィード ─────────────────────────────────────────────
+# ─── DuckDuckGo 経由でジョブURLを収集 ────────────────────────────────
+# GitHub Actions の IP は各プラットフォームで直接ブロックされる。
+# DuckDuckGo は DDG 自身がインデックス済みのページを返すため迂回可能。
+async def search_ddg(client: httpx.AsyncClient, query: str) -> list[str]:
+    """DuckDuckGo HTML 検索からURLリストを返す"""
+    urls = []
+    try:
+        r = await client.get(
+            "https://html.duckduckgo.com/html/",
+            params={"q": query},
+            timeout=20,
+        )
+        if r.status_code != 200:
+            return []
+        soup = BeautifulSoup(r.text, "lxml")
+        for a in soup.select("a.result__url, a[href*='uddg=']"):
+            href = a.get("href", "")
+            # DDG がリダイレクト URL でラップしている場合は展開
+            m = re.search(r"uddg=([^&]+)", href)
+            if m:
+                    href = urllib.parse.unquote(m.group(1))
+            if href.startswith("http"):
+                urls.append(href)
+    except Exception as e:
+        print(f"  [DDG error] {e}")
+    return urls
+
+
 async def scrape_lancers(client: httpx.AsyncClient) -> list[dict]:
     jobs = []
-    for kw in KEYWORDS:
-        url = (
-            f"https://www.lancers.jp/work/search.rss"
-            f"?open=1&sort=new&work_type[]=project&keyword={kw}"
-        )
-        try:
-            r = await client.get(url, timeout=20)
-            if r.status_code != 200:
-                print(f"  [Lancers RSS] {kw}: status={r.status_code}")
-                continue
+    seen_urls: set[str] = set()
 
-            feed = feedparser.parse(r.text)
-            for entry in feed.entries[:8]:
-                title   = entry.get("title", "").strip()
-                job_url = entry.get("link", "").strip()
-                summary = entry.get("summary", "")
-                if not title or not job_url:
+    for kw in KEYWORDS[:10]:  # DDG レート制限のため上位10キーワードに絞る
+        query = f"site:lancers.jp/work/detail {kw}"
+        urls  = await search_ddg(client, query)
+        await asyncio.sleep(0.5)  # DDG レート制限回避
+
+        for url in urls:
+            if "lancers.jp/work/detail" not in url:
+                continue
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+
+            # 案件ページを直接取得（Lancers の個別ページは通常アクセス可）
+            try:
+                r = await client.get(url, timeout=20)
+                if r.status_code != 200:
                     continue
-                budget = parse_budget(summary)
+                soup = BeautifulSoup(r.text, "lxml")
+                for tag in soup(["script", "style", "nav", "footer"]):
+                    tag.decompose()
+                text = soup.get_text(separator="\n", strip=True)
+
+                # タイトル
+                title_tag = soup.find("h1") or soup.find("title")
+                title = title_tag.get_text(strip=True) if title_tag else url.split("/")[-1]
+
+                budget = parse_budget(text)
                 if budget < MIN_BUDGET:
                     continue
+
                 jobs.append({
                     "platform": "ランサーズ",
-                    "title": title,
-                    "url": job_url,
+                    "title": title[:80],
+                    "url": url,
                     "budget": budget,
-                    "description": BeautifulSoup(summary, "lxml").get_text()[:800],
+                    "description": text[:1200],
                 })
-        except Exception as e:
-            print(f"  [Lancers RSS error] {kw}: {e}")
+            except Exception:
+                continue
 
     result = dedupe(jobs)
     print(f"  [Lancers] {len(result)}件")
     return result
 
 
-# ─── CW: Playwright（ノーログイン） ───────────────────────────────────
-async def scrape_crowdworks(browser) -> list[dict]:
-    page = await browser.new_page()
+async def scrape_crowdworks(client: httpx.AsyncClient) -> list[dict]:
     jobs = []
+    seen_urls: set[str] = set()
 
-    try:
-        for kw in KEYWORDS:
-            url = (
-                f"https://crowdworks.jp/public/jobs/search"
-                f"?order=new_job&keyword={kw}&job_type=fixed_work"
-            )
-            await page.goto(url, timeout=45000)
+    for kw in KEYWORDS[:10]:
+        query = f"site:crowdworks.jp/public/jobs {kw} 固定報酬"
+        urls  = await search_ddg(client, query)
+        await asyncio.sleep(0.5)
 
-            # JS レンダリング待機
+        for url in urls:
+            if "crowdworks.jp/public/jobs" not in url:
+                continue
+            if any(x in url for x in ["/search", "/category", "/skill"]):
+                continue
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+
             try:
-                await page.wait_for_selector(
-                    "a[href*='/public/jobs/offers/'], "
-                    "a[href*='/public/jobs/group_'], "
-                    ".job_offer__name a, "
-                    "h3 a[href*='crowdworks']",
-                    timeout=12000
-                )
-            except Exception:
-                pass  # タイムアウトしても続行
+                r = await client.get(url, timeout=20)
+                if r.status_code != 200:
+                    continue
+                soup = BeautifulSoup(r.text, "lxml")
+                for tag in soup(["script", "style", "nav", "footer"]):
+                    tag.decompose()
+                text = soup.get_text(separator="\n", strip=True)
 
-            # 全リンクから案件URLを抽出
-            links = await page.query_selector_all("a[href*='/public/jobs/']")
-            for link in links[:12]:
-                try:
-                    title   = (await link.inner_text()).strip()
-                    href    = await link.get_attribute("href") or ""
-                    job_url = f"https://crowdworks.jp{href}" if href.startswith("/") else href
+                title_tag = soup.find("h1") or soup.find("title")
+                title = title_tag.get_text(strip=True) if title_tag else "案件"
 
-                    if (
-                        not title or len(title) < 5
-                        or any(x in href for x in ["/search", "/category", "/skill", "/new", "?"])
-                        or not re.search(r"/jobs/\d+|/offers/\d+|/group_", href)
-                    ):
-                        continue
-
-                    parent = await link.evaluate_handle(
-                        "el => el.closest('li, article, tr, div[class*=job]') || el.parentElement"
-                    )
-                    parent_text = await parent.inner_text() if parent else ""
-                    budget = parse_budget(parent_text)
-
-                    if budget < MIN_BUDGET:
-                        continue
-
-                    jobs.append({
-                        "platform": "クラウドワークス",
-                        "title": title,
-                        "url": job_url,
-                        "budget": budget,
-                        "description": "",
-                    })
-                except Exception:
+                budget = parse_budget(text)
+                if budget < MIN_BUDGET:
                     continue
 
-        # 詳細取得（上位10件）
-        for job in dedupe(jobs)[:10]:
-            try:
-                await page.goto(job["url"], timeout=20000)
-                await page.wait_for_load_state("domcontentloaded", timeout=10000)
-                body = await page.inner_text("body")
-                job["description"] = body[:1200]
+                jobs.append({
+                    "platform": "クラウドワークス",
+                    "title": title[:80],
+                    "url": url,
+                    "budget": budget,
+                    "description": text[:1200],
+                })
             except Exception:
-                pass
-
-    except Exception as e:
-        print(f"  [CW error] {e}")
-    finally:
-        await page.close()
+                continue
 
     result = dedupe(jobs)
     print(f"  [CW] {len(result)}件")
@@ -274,17 +283,11 @@ async def main():
     seen = load_seen()
 
     async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True) as client:
-        # Lancers (RSS) と CW (Playwright) を並行実行
-        async with async_playwright() as pw:
-            browser = await pw.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage"],
-            )
-            lancers_jobs, cw_jobs = await asyncio.gather(
-                scrape_lancers(client),
-                scrape_crowdworks(browser),
-            )
-            await browser.close()
+        # DuckDuckGo 経由で Lancers / CW を並行スキャン
+        lancers_jobs, cw_jobs = await asyncio.gather(
+            scrape_lancers(client),
+            scrape_crowdworks(client),
+        )
 
         all_jobs = dedupe(lancers_jobs + cw_jobs)
         new_jobs  = [j for j in all_jobs if j["url"] not in seen]
