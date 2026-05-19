@@ -1,0 +1,45 @@
+name: Freelance Hunter
+
+on:
+  schedule:
+    - cron: '0 0,3,6,9,12,15,18,21 * * *'  # 3時間おき（日本時間 9,12,15,18,21,0,3,6時）
+  workflow_dispatch:  # 手動実行も可能
+
+jobs:
+  hunt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore seen jobs cache
+        uses: actions/cache@v4
+        with:
+          path: seen_jobs.json
+          key: seen-jobs-${{ github.run_id }}
+          restore-keys: seen-jobs-
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium --with-deps
+
+      - name: Run hunter
+        env:
+          LANCERS_EMAIL:    ${{ secrets.LANCERS_EMAIL }}
+          LANCERS_PASSWORD: ${{ secrets.LANCERS_PASSWORD }}
+          CW_EMAIL:         ${{ secrets.CW_EMAIL }}
+          CW_PASSWORD:      ${{ secrets.CW_PASSWORD }}
+          DISCORD_WEBHOOK_FREELANCE: ${{ secrets.DISCORD_WEBHOOK_FREELANCE }}
+          GEMINI_API_KEY:   ${{ secrets.GEMINI_API_KEY }}
+        run: python hunter.py
+
+      - name: Save seen jobs cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: seen_jobs.json
+          key: seen-jobs-${{ github.run_id }}
