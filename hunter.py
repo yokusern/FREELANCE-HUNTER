@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-FREELANCE-HUNTER
-────────────────
-ランサーズ・クラウドワークスを自動スキャンし、
+FREELANCE-HUNTER 最強版
+────────────────────────
+httpx + BeautifulSoup で高速スキャン（ブラウザ不要）
 Gemini で案件評価 + 提案文生成 → Discord 通知
+毎時間自動起動
 """
 
 import asyncio
@@ -11,59 +12,75 @@ import json
 import os
 import re
 from pathlib import Path
-from playwright.async_api import async_playwright, Page
-import google.generativeai as genai
+
 import httpx
+from bs4 import BeautifulSoup
+import google.generativeai as genai
 
 # ─── 環境変数 ──────────────────────────────────────────────────────────
-LANCERS_EMAIL    = os.environ.get("LANCERS_EMAIL", "")
-LANCERS_PASSWORD = os.environ.get("LANCERS_PASSWORD", "")
-CW_EMAIL         = os.environ.get("CW_EMAIL", "")
-CW_PASSWORD      = os.environ.get("CW_PASSWORD", "")
-DISCORD_WEBHOOK  = os.environ["DISCORD_WEBHOOK_FREELANCE"]
-GEMINI_API_KEY   = os.environ["GEMINI_API_KEY"]
+DISCORD_WEBHOOK = os.environ["DISCORD_WEBHOOK_FREELANCE"]
+GEMINI_API_KEY  = os.environ["GEMINI_API_KEY"]
 
-# ─── 検索キーワード ────────────────────────────────────────────────────
+# ─── リクエストヘッダー（実ブラウザに見せかける） ────────────────────────
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ja,en-US;q=0.7,en;q=0.3",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+}
+
+# ─── 検索キーワード（幅広くとって Gemini で絞る） ──────────────────────
 KEYWORDS = [
-    "Next.js", "React", "Python", "FastAPI",
-    "AIチャットボット", "Webアプリ", "LP制作",
-    "ダッシュボード", "Supabase", "管理画面",
+    "Next.js", "React", "TypeScript", "Python",
+    "FastAPI", "AIチャットボット", "LINE Bot",
+    "Webアプリ", "LP制作", "ランディングページ",
+    "管理画面", "ダッシュボード", "Supabase",
+    "システム開発", "API開発", "フロントエンド",
+    "Web制作", "Webサイト作成",
 ]
 
-# ─── フィルタ条件 ──────────────────────────────────────────────────────
-MAX_APPLICANTS = 15
-MIN_BUDGET     = 20_000
+# ─── フィルタ ──────────────────────────────────────────────────────────
+MIN_BUDGET = 15_000   # 1.5万円以上
 
-# ─── 自分のプロフィール（提案文生成に使用） ────────────────────────────
+# ─── 自分のプロフィール ────────────────────────────────────────────────
 MY_PROFILE = """
-スキル:
+【スキル】
 - Next.js / React / TypeScript（フロントエンド）
-- Python / FastAPI（バックエンド API）
-- AIチャットボット構築（Claude / Gemini / OpenAI API）
-- Supabase / PostgreSQL（データベース設計・RLS）
-- Webアプリ / 管理画面 / ダッシュボード開発
-- LP制作（レスポンシブ対応）
-- Webスクレイピング（Playwright / BeautifulSoup）
-- Vercel / Render デプロイ・運用
+- Python / FastAPI（バックエンド API 設計・実装）
+- AI チャットボット構築（Claude / Gemini / OpenAI API 統合）
+- Supabase / PostgreSQL（スキーマ設計・RLS・認証）
+- 管理画面 / ダッシュボード / LP 制作
+- LINE Bot / Discord Bot
+- Web スクレイピング（Playwright / BeautifulSoup）
+- Vercel / Render（デプロイ・運用）
 
-実績（ポートフォリオ）:
-- FX分析AIシステム（FastAPI + Next.js + Supabase + Gemini）
-- AIチャットボットSaaS（データベース不要、暗号化URL方式）
-- リアルタイムビジネスダッシュボード（複数API統合）
+【実績】
+- FX 分析 AI システム（FastAPI + Next.js + Supabase + Gemini 統合）
+- 暗号化 URL 方式の AI チャットボット SaaS（DB 不要、B2B 向け）
+- リアルタイム KPI ダッシュボード（複数 API 統合、自動更新）
 
-経験: Web開発 2年、AI統合案件多数
+経験: Web 開発 2 年、AI 統合案件多数、全案件 Vercel/Render でデプロイ実績あり
 """
 
-# ─── 既通知済みURLを管理（同じ案件を何度も通知しない） ──────────────────
+# ─── 既通知済みURL管理 ────────────────────────────────────────────────
 SEEN_FILE = Path("seen_jobs.json")
 
 def load_seen() -> set:
     if SEEN_FILE.exists():
-        return set(json.loads(SEEN_FILE.read_text()))
+        try:
+            return set(json.loads(SEEN_FILE.read_text()))
+        except Exception:
+            pass
     return set()
 
 def save_seen(seen: set):
-    SEEN_FILE.write_text(json.dumps(list(seen)))
+    SEEN_FILE.write_text(json.dumps(sorted(seen), ensure_ascii=False, indent=2))
 
 
 # ─── Gemini 評価 ───────────────────────────────────────────────────────
@@ -71,25 +88,31 @@ genai.configure(api_key=GEMINI_API_KEY)
 _model = genai.GenerativeModel("gemini-2.0-flash")
 
 def evaluate(title: str, description: str, budget: int) -> dict:
-    prompt = f"""あなたはフリーランスエンジニアのキャリアアドバイザーです。
-以下の案件を評価し、JSONのみ返してください。
+    prompt = f"""あなたは優秀なフリーランスエンジニアのマネージャーです。
+以下の案件に応募すべきか評価し、JSONのみ返してください。
 
-【私のプロフィール】
+【担当エンジニアのスキル】
 {MY_PROFILE}
 
 【案件情報】
 タイトル: {title}
 予算: ¥{budget:,}
-説明: {description[:800]}
+説明: {description[:1000]}
 
-返すJSONの形式:
+【評価基準】
+- スキルと合致しているか
+- 予算が妥当か（時間見積もり考慮）
+- 難易度が高すぎないか（初案件でも対応可能か）
+- 詐欺・悪質案件でないか
+
+返すJSONの形式（前置き・後置き不要、JSONのみ）:
 {{
   "score": 1〜10の整数（10が最適合）,
   "should_apply": true か false,
-  "reason": "判断理由を1〜2文で",
-  "proposal": "提案文300字程度（です・ます調、クライアントに送れる完成形で）"
-}}
-JSONのみ返してください。前置き・後置き不要。"""
+  "reason": "判断理由を1文で",
+  "estimate_hours": 予想作業時間（整数）,
+  "proposal": "提案文400字程度（です・ます調、クライアントにそのまま送れる完成形。自己紹介・実績・具体的な進め方を含める）"
+}}"""
 
     try:
         resp = _model.generate_content(prompt)
@@ -99,38 +122,52 @@ JSONのみ返してください。前置き・後置き不要。"""
             return json.loads(m.group())
     except Exception as e:
         print(f"  [Gemini error] {e}")
-    return {"score": 0, "should_apply": False, "reason": "評価失敗", "proposal": ""}
+    return {"score": 0, "should_apply": False, "reason": "評価失敗", "proposal": "", "estimate_hours": 0}
 
 
 # ─── Discord 通知 ──────────────────────────────────────────────────────
-async def notify(job: dict, ev: dict):
+async def notify(job: dict, ev: dict, client: httpx.AsyncClient):
     score = ev.get("score", 0)
-    emoji = "🟢" if score >= 7 else "🟡"
-    label = "【応募推奨】" if ev.get("should_apply") else "【参考】"
+    hours = ev.get("estimate_hours", 0)
+    hourly = job["budget"] // hours if hours > 0 else 0
+    emoji  = "🟢" if score >= 7 else "🟡"
+    label  = "【即応募】" if ev.get("should_apply") and score >= 8 else "【応募推奨】" if ev.get("should_apply") else "【参考】"
 
     msg = (
         f"{emoji} {label} **{job['platform']}**\n\n"
         f"📋 **{job['title']}**\n"
-        f"💰 予算: ¥{job.get('budget', 0):,}\n"
-        f"👥 応募者: {job.get('applicants', '不明')}人\n"
-        f"⭐ 適合度: {score}/10 — {ev.get('reason', '')}\n"
+        f"💰 予算: ¥{job['budget']:,}"
+        + (f"  ⏱ 推定{hours}h → 時給換算¥{hourly:,}" if hours > 0 else "")
+        + f"\n⭐ 適合度: {score}/10 — {ev.get('reason', '')}\n"
         f"🔗 {job['url']}\n\n"
         f"📝 **提案文（コピペ用）**\n"
         f"```\n{ev.get('proposal', '')}\n```"
     )
 
-    async with httpx.AsyncClient() as client:
-        await client.post(DISCORD_WEBHOOK, json={"content": msg})
+    await client.post(DISCORD_WEBHOOK, json={"content": msg}, timeout=10)
+    print(f"  → Discord 送信: [{score}/10] {job['title'][:40]}")
 
 
-# ─── ユーティリティ ────────────────────────────────────────────────────
+# ─── HTML フェッチ ─────────────────────────────────────────────────────
+async def fetch(client: httpx.AsyncClient, url: str) -> BeautifulSoup | None:
+    try:
+        r = await client.get(url, timeout=20)
+        if r.status_code == 200:
+            return BeautifulSoup(r.text, "lxml")
+    except Exception as e:
+        print(f"  [fetch error] {url[:60]}: {e}")
+    return None
+
+
+# ─── 予算パース ────────────────────────────────────────────────────────
 def parse_budget(text: str) -> int:
     nums = re.findall(r"[\d,]+", text.replace("，", ","))
-    for n in reversed(nums):
+    candidates = []
+    for n in nums:
         v = int(n.replace(",", ""))
-        if v >= 1000:
-            return v
-    return 0
+        if 1_000 <= v <= 10_000_000:
+            candidates.append(v)
+    return max(candidates) if candidates else 0
 
 def dedupe(jobs: list) -> list:
     seen, out = set(), []
@@ -141,176 +178,129 @@ def dedupe(jobs: list) -> list:
     return out
 
 
-# ─── Lancers スクレイピング（ログインなし・公開ページ） ──────────────────
-async def scrape_lancers(browser) -> list[dict]:
-    page = await browser.new_page()
+# ─── Lancers スクレイピング ────────────────────────────────────────────
+async def scrape_lancers(client: httpx.AsyncClient) -> list[dict]:
     jobs = []
+    for kw in KEYWORDS:
+        url = (
+            f"https://www.lancers.jp/work/search"
+            f"?open=1&sort=new&keyword={kw}&work_type[]=project"
+        )
+        soup = await fetch(client, url)
+        if not soup:
+            continue
 
-    try:
-        for kw in KEYWORDS:
-            url = (
-                f"https://www.lancers.jp/work/search"
-                f"?open=1&sort=new&keyword={kw}&work_type[]=project"
-            )
-            await page.goto(url, timeout=60000)
-            await page.wait_for_load_state("domcontentloaded", timeout=30000)
+        for tag in soup.find_all("a", href=re.compile(r"/work/detail/")):
+            title = tag.get_text(strip=True)
+            href  = tag.get("href", "")
+            if not title or len(title) < 5:
+                continue
+            job_url = f"https://www.lancers.jp{href}" if href.startswith("/") else href
 
-            # ページHTML全体からリンクと金額を抽出
-            links = await page.query_selector_all("a[href*='/work/detail/']")
-            for link in links[:10]:
-                try:
-                    title   = (await link.inner_text()).strip()
-                    href    = await link.get_attribute("href") or ""
-                    job_url = f"https://www.lancers.jp{href}" if href.startswith("/") else href
-                    if not title or not job_url or len(title) < 5:
-                        continue
+            parent = tag.find_parent(["li", "article", "div"]) or tag.parent
+            budget = parse_budget(parent.get_text() if parent else "")
 
-                    # 親要素から予算を探す
-                    parent = await link.evaluate_handle("el => el.closest('li, article, div[class*=item]') || el.parentElement")
-                    parent_text = await parent.inner_text() if parent else ""
-                    budget = parse_budget(parent_text)
+            if budget < MIN_BUDGET:
+                continue
 
-                    if budget < MIN_BUDGET:
-                        continue
+            jobs.append({
+                "platform": "ランサーズ",
+                "title": title,
+                "url": job_url,
+                "budget": budget,
+                "description": "",
+            })
 
-                    jobs.append({
-                        "platform": "ランサーズ",
-                        "title": title,
-                        "url": job_url,
-                        "budget": budget,
-                        "applicants": "不明",
-                        "description": "",
-                    })
-                except Exception:
-                    continue
+    jobs = dedupe(jobs)
 
-        # 詳細説明を取得（最大10件）
-        for job in jobs[:10]:
-            try:
-                await page.goto(job["url"], timeout=30000)
-                await page.wait_for_load_state("domcontentloaded", timeout=20000)
-                body = await page.inner_text("body")
-                # 説明部分を抽出（最初の800文字）
-                job["description"] = body[:800]
-            except Exception:
-                pass
+    # 詳細説明を取得（上位15件）
+    for job in jobs[:15]:
+        soup = await fetch(client, job["url"])
+        if soup:
+            for tag in soup(["script", "style", "nav", "header", "footer"]):
+                tag.decompose()
+            job["description"] = soup.get_text(separator="\n", strip=True)[:1200]
 
-        print(f"  [Lancers] {len(jobs)}件取得")
-
-    except Exception as e:
-        try:
-            await page.screenshot(path="lancers_error.png")
-        except Exception:
-            pass
-        print(f"  [Lancers error] {e}")
-    finally:
-        await page.close()
-
-    return dedupe(jobs)
+    print(f"  [Lancers] {len(jobs)}件")
+    return jobs
 
 
-# ─── Crowdworks スクレイピング（ログインなし・公開ページ） ────────────────
-async def scrape_crowdworks(browser) -> list[dict]:
-    page = await browser.new_page()
+# ─── Crowdworks スクレイピング ─────────────────────────────────────────
+async def scrape_crowdworks(client: httpx.AsyncClient) -> list[dict]:
     jobs = []
+    for kw in KEYWORDS:
+        url = (
+            f"https://crowdworks.jp/public/jobs/search"
+            f"?order=new_job&keep_search_form=true&keyword={kw}&job_type=fixed_work"
+        )
+        soup = await fetch(client, url)
+        if not soup:
+            continue
 
-    try:
-        for kw in KEYWORDS:
-            url = (
-                f"https://crowdworks.jp/public/jobs/search"
-                f"?order=new_job&keep_search_form=true&keyword={kw}&job_type=fixed_work"
-            )
-            await page.goto(url, timeout=60000)
-            await page.wait_for_load_state("domcontentloaded", timeout=30000)
+        for tag in soup.find_all("a", href=re.compile(r"/public/jobs/\d+")):
+            title = tag.get_text(strip=True)
+            href  = tag.get("href", "")
+            if not title or len(title) < 5:
+                continue
+            if any(x in href for x in ["/search", "/category", "/skill"]):
+                continue
+            job_url = f"https://crowdworks.jp{href}" if href.startswith("/") else href
 
-            links = await page.query_selector_all("a[href*='/public/jobs/']")
-            for link in links[:10]:
-                try:
-                    title   = (await link.inner_text()).strip()
-                    href    = await link.get_attribute("href") or ""
-                    job_url = f"https://crowdworks.jp{href}" if href.startswith("/") else href
-                    if not title or not job_url or len(title) < 5:
-                        continue
-                    if "/search" in job_url or "/category" in job_url:
-                        continue
+            parent = tag.find_parent(["li", "article", "div"]) or tag.parent
+            budget = parse_budget(parent.get_text() if parent else "")
 
-                    parent = await link.evaluate_handle("el => el.closest('li, article, div[class*=job]') || el.parentElement")
-                    parent_text = await parent.inner_text() if parent else ""
-                    budget = parse_budget(parent_text)
+            if budget < MIN_BUDGET:
+                continue
 
-                    if budget < MIN_BUDGET:
-                        continue
+            jobs.append({
+                "platform": "クラウドワークス",
+                "title": title,
+                "url": job_url,
+                "budget": budget,
+                "description": "",
+            })
 
-                    jobs.append({
-                        "platform": "クラウドワークス",
-                        "title": title,
-                        "url": job_url,
-                        "budget": budget,
-                        "applicants": "不明",
-                        "description": "",
-                    })
-                except Exception:
-                    continue
+    jobs = dedupe(jobs)
 
-        # 詳細説明を取得（最大10件）
-        for job in jobs[:10]:
-            try:
-                await page.goto(job["url"], timeout=30000)
-                await page.wait_for_load_state("domcontentloaded", timeout=20000)
-                body = await page.inner_text("body")
-                job["description"] = body[:800]
-            except Exception:
-                pass
+    for job in jobs[:15]:
+        soup = await fetch(client, job["url"])
+        if soup:
+            for tag in soup(["script", "style", "nav", "header", "footer"]):
+                tag.decompose()
+            job["description"] = soup.get_text(separator="\n", strip=True)[:1200]
 
-        print(f"  [CW] {len(jobs)}件取得")
-
-    except Exception as e:
-        try:
-            await page.screenshot(path="cw_error.png")
-        except Exception:
-            pass
-        print(f"  [CW error] {e}")
-    finally:
-        await page.close()
-
-    return dedupe(jobs)
+    print(f"  [CW] {len(jobs)}件")
+    return jobs
 
 
 # ─── メイン ───────────────────────────────────────────────────────────
 async def main():
     print("=== FREELANCE-HUNTER 起動 ===")
     seen = load_seen()
-    all_jobs: list[dict] = []
 
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
+    async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True) as client:
+        lancers_jobs, cw_jobs = await asyncio.gather(
+            scrape_lancers(client),
+            scrape_crowdworks(client),
         )
-        lancers_jobs = await scrape_lancers(browser)
-        cw_jobs      = await scrape_crowdworks(browser)
-        await browser.close()
         all_jobs = dedupe(lancers_jobs + cw_jobs)
+        print(f"合計: {len(all_jobs)}件 / 未通知: ", end="")
 
-    print(f"取得: {len(all_jobs)}件 → 未通知: ", end="")
+        new_jobs = [j for j in all_jobs if j["url"] not in seen]
+        print(f"{len(new_jobs)}件")
 
-    new_jobs = [j for j in all_jobs if j["url"] not in seen]
-    print(f"{len(new_jobs)}件")
+        notified = 0
+        for job in new_jobs:
+            ev = evaluate(job["title"], job["description"], job["budget"])
+            seen.add(job["url"])
 
-    notified = 0
-    for job in new_jobs:
-        ev = evaluate(job["title"], job["description"], job["budget"])
-        score = ev.get("score", 0)
-        print(f"  [{score}/10] {job['title'][:40]}")
+            if ev.get("score", 0) >= 6:
+                await notify(job, ev, client)
+                notified += 1
+                await asyncio.sleep(1)  # Discord レート制限回避
 
-        if score >= 6:
-            await notify(job, ev)
-            notified += 1
-
-        seen.add(job["url"])
-
-    save_seen(seen)
-    print(f"通知送信: {notified}件 / スキャン完了")
+        save_seen(seen)
+        print(f"通知: {notified}件 / 完了")
 
 
 if __name__ == "__main__":
