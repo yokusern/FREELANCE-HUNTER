@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-FREELANCE-HUNTER 最強版
-────────────────────────
-httpx + BeautifulSoup で高速スキャン（ブラウザ不要）
-Gemini で案件評価 + 提案文生成 → Discord 通知
-毎時間自動起動
+FREELANCE-HUNTER
+────────────────
+Lancers  : RSS フィード（Cloudflare 回避）
+CW       : Playwright ノーログイン（JS レンダリング対応）
+Gemini   : 案件評価 + 提案文生成
+Discord  : 通知
 """
 
 import asyncio
@@ -13,59 +14,54 @@ import os
 import re
 from pathlib import Path
 
+import feedparser
 import httpx
 from bs4 import BeautifulSoup
+from playwright.async_api import async_playwright
 import google.generativeai as genai
 
 # ─── 環境変数 ──────────────────────────────────────────────────────────
 DISCORD_WEBHOOK = os.environ["DISCORD_WEBHOOK_FREELANCE"]
 GEMINI_API_KEY  = os.environ["GEMINI_API_KEY"]
 
-# ─── リクエストヘッダー（実ブラウザに見せかける） ────────────────────────
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "ja,en-US;q=0.7,en;q=0.3",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
 }
 
-# ─── 検索キーワード（幅広くとって Gemini で絞る） ──────────────────────
+# ─── 検索キーワード ────────────────────────────────────────────────────
 KEYWORDS = [
     "Next.js", "React", "TypeScript", "Python",
     "FastAPI", "AIチャットボット", "LINE Bot",
     "Webアプリ", "LP制作", "ランディングページ",
     "管理画面", "ダッシュボード", "Supabase",
     "システム開発", "API開発", "フロントエンド",
-    "Web制作", "Webサイト作成",
+    "Web制作", "Webサイト",
 ]
 
-# ─── フィルタ ──────────────────────────────────────────────────────────
-MIN_BUDGET = 15_000   # 1.5万円以上
+MIN_BUDGET = 15_000
 
-# ─── 自分のプロフィール ────────────────────────────────────────────────
 MY_PROFILE = """
 【スキル】
 - Next.js / React / TypeScript（フロントエンド）
-- Python / FastAPI（バックエンド API 設計・実装）
+- Python / FastAPI（バックエンド API）
 - AI チャットボット構築（Claude / Gemini / OpenAI API 統合）
-- Supabase / PostgreSQL（スキーマ設計・RLS・認証）
+- Supabase / PostgreSQL（スキーマ設計・RLS）
 - 管理画面 / ダッシュボード / LP 制作
 - LINE Bot / Discord Bot
-- Web スクレイピング（Playwright / BeautifulSoup）
+- Web スクレイピング（Playwright）
 - Vercel / Render（デプロイ・運用）
 
 【実績】
-- FX 分析 AI システム（FastAPI + Next.js + Supabase + Gemini 統合）
-- 暗号化 URL 方式の AI チャットボット SaaS（DB 不要、B2B 向け）
-- リアルタイム KPI ダッシュボード（複数 API 統合、自動更新）
+- FX 分析 AI システム（FastAPI + Next.js + Supabase + Gemini）
+- AI チャットボット SaaS（暗号化 URL 方式、DB 不要）
+- リアルタイム KPI ダッシュボード（複数 API 統合）
 
-経験: Web 開発 2 年、AI 統合案件多数、全案件 Vercel/Render でデプロイ実績あり
+経験: Web 開発 2 年、AI 統合案件多数
 """
 
 # ─── 既通知済みURL管理 ────────────────────────────────────────────────
@@ -89,7 +85,7 @@ _model = genai.GenerativeModel("gemini-2.0-flash")
 
 def evaluate(title: str, description: str, budget: int) -> dict:
     prompt = f"""あなたは優秀なフリーランスエンジニアのマネージャーです。
-以下の案件に応募すべきか評価し、JSONのみ返してください。
+以下の案件を評価し、JSONのみ返してください（前置き不要）。
 
 【担当エンジニアのスキル】
 {MY_PROFILE}
@@ -99,83 +95,50 @@ def evaluate(title: str, description: str, budget: int) -> dict:
 予算: ¥{budget:,}
 説明: {description[:1000]}
 
-【評価基準】
-- スキルと合致しているか
-- 予算が妥当か（時間見積もり考慮）
-- 難易度が高すぎないか（初案件でも対応可能か）
-- 詐欺・悪質案件でないか
-
-返すJSONの形式（前置き・後置き不要、JSONのみ）:
+返すJSON:
 {{
-  "score": 1〜10の整数（10が最適合）,
-  "should_apply": true か false,
-  "reason": "判断理由を1文で",
+  "score": 1〜10,
+  "should_apply": true/false,
+  "reason": "判断理由1文",
   "estimate_hours": 予想作業時間（整数）,
-  "proposal": "提案文400字程度（です・ます調、クライアントにそのまま送れる完成形。自己紹介・実績・具体的な進め方を含める）"
+  "proposal": "提案文400字（です・ます調、そのまま送れる完成形）"
 }}"""
 
     try:
         resp = _model.generate_content(prompt)
-        text = resp.text.strip()
-        m = re.search(r"\{.*\}", text, re.DOTALL)
+        m = re.search(r"\{.*\}", resp.text.strip(), re.DOTALL)
         if m:
             return json.loads(m.group())
     except Exception as e:
-        print(f"  [Gemini error] {e}")
+        print(f"  [Gemini] {e}")
     return {"score": 0, "should_apply": False, "reason": "評価失敗", "proposal": "", "estimate_hours": 0}
 
 
 # ─── Discord 通知 ──────────────────────────────────────────────────────
 async def notify(job: dict, ev: dict, client: httpx.AsyncClient):
-    score = ev.get("score", 0)
-    hours = ev.get("estimate_hours", 0)
+    score  = ev.get("score", 0)
+    hours  = ev.get("estimate_hours", 0)
     hourly = job["budget"] // hours if hours > 0 else 0
     emoji  = "🟢" if score >= 7 else "🟡"
-    label  = "【即応募】" if ev.get("should_apply") and score >= 8 else "【応募推奨】" if ev.get("should_apply") else "【参考】"
+    label  = "【即応募】" if score >= 8 else "【応募推奨】"
 
     msg = (
         f"{emoji} {label} **{job['platform']}**\n\n"
         f"📋 **{job['title']}**\n"
         f"💰 予算: ¥{job['budget']:,}"
-        + (f"  ⏱ 推定{hours}h → 時給換算¥{hourly:,}" if hours > 0 else "")
-        + f"\n⭐ 適合度: {score}/10 — {ev.get('reason', '')}\n"
+        + (f"　⏱ 推定{hours}h → 時給¥{hourly:,}" if hours > 0 else "")
+        + f"\n⭐ 適合度: {score}/10 — {ev.get('reason','')}\n"
         f"🔗 {job['url']}\n\n"
-        f"📝 **提案文（コピペ用）**\n"
-        f"```\n{ev.get('proposal', '')}\n```"
+        f"📝 **提案文（コピペ用）**\n```\n{ev.get('proposal','')}\n```"
     )
-
     await client.post(DISCORD_WEBHOOK, json={"content": msg}, timeout=10)
-    print(f"  → Discord 送信: [{score}/10] {job['title'][:40]}")
+    print(f"  ✓ [{score}/10] {job['title'][:40]}")
 
 
-# ─── HTML フェッチ ─────────────────────────────────────────────────────
-async def fetch(client: httpx.AsyncClient, url: str, debug: bool = False) -> BeautifulSoup | None:
-    try:
-        r = await client.get(url, timeout=20)
-        if debug:
-            soup_tmp = BeautifulSoup(r.text, "lxml")
-            title = soup_tmp.find("title")
-            all_links = soup_tmp.find_all("a", href=True)
-            print(f"  [debug] status={r.status_code} title={title.text[:50] if title else 'N/A'}")
-            print(f"  [debug] 全リンク数={len(all_links)}")
-            hrefs = [a.get('href','') for a in all_links[:10]]
-            print(f"  [debug] hrefs例: {hrefs}")
-        if r.status_code == 200:
-            return BeautifulSoup(r.text, "lxml")
-        print(f"  [fetch] status={r.status_code} {url[:60]}")
-    except Exception as e:
-        print(f"  [fetch error] {url[:60]}: {e}")
-    return None
-
-
-# ─── 予算パース ────────────────────────────────────────────────────────
+# ─── ユーティリティ ────────────────────────────────────────────────────
 def parse_budget(text: str) -> int:
     nums = re.findall(r"[\d,]+", text.replace("，", ","))
-    candidates = []
-    for n in nums:
-        v = int(n.replace(",", ""))
-        if 1_000 <= v <= 10_000_000:
-            candidates.append(v)
+    candidates = [int(n.replace(",", "")) for n in nums if 1_000 <= int(n.replace(",", "")) <= 10_000_000]
     return max(candidates) if candidates else 0
 
 def dedupe(jobs: list) -> list:
@@ -187,99 +150,122 @@ def dedupe(jobs: list) -> list:
     return out
 
 
-# ─── Lancers スクレイピング ────────────────────────────────────────────
+# ─── Lancers: RSS フィード ─────────────────────────────────────────────
 async def scrape_lancers(client: httpx.AsyncClient) -> list[dict]:
     jobs = []
-    for i, kw in enumerate(KEYWORDS):
+    for kw in KEYWORDS:
         url = (
-            f"https://www.lancers.jp/work/search"
-            f"?open=1&sort=new&keyword={kw}&work_type[]=project"
+            f"https://www.lancers.jp/work/search.rss"
+            f"?open=1&sort=new&work_type[]=project&keyword={kw}"
         )
-        soup = await fetch(client, url, debug=(i == 0))  # 最初の1件だけデバッグ
-        if not soup:
-            continue
-
-        for tag in soup.find_all("a", href=re.compile(r"/work/detail/")):
-            title = tag.get_text(strip=True)
-            href  = tag.get("href", "")
-            if not title or len(title) < 5:
-                continue
-            job_url = f"https://www.lancers.jp{href}" if href.startswith("/") else href
-
-            parent = tag.find_parent(["li", "article", "div"]) or tag.parent
-            budget = parse_budget(parent.get_text() if parent else "")
-
-            if budget < MIN_BUDGET:
+        try:
+            r = await client.get(url, timeout=20)
+            if r.status_code != 200:
+                print(f"  [Lancers RSS] {kw}: status={r.status_code}")
                 continue
 
-            jobs.append({
-                "platform": "ランサーズ",
-                "title": title,
-                "url": job_url,
-                "budget": budget,
-                "description": "",
-            })
+            feed = feedparser.parse(r.text)
+            for entry in feed.entries[:8]:
+                title   = entry.get("title", "").strip()
+                job_url = entry.get("link", "").strip()
+                summary = entry.get("summary", "")
+                if not title or not job_url:
+                    continue
+                budget = parse_budget(summary)
+                if budget < MIN_BUDGET:
+                    continue
+                jobs.append({
+                    "platform": "ランサーズ",
+                    "title": title,
+                    "url": job_url,
+                    "budget": budget,
+                    "description": BeautifulSoup(summary, "lxml").get_text()[:800],
+                })
+        except Exception as e:
+            print(f"  [Lancers RSS error] {kw}: {e}")
 
-    jobs = dedupe(jobs)
-
-    # 詳細説明を取得（上位15件）
-    for job in jobs[:15]:
-        soup = await fetch(client, job["url"])
-        if soup:
-            for tag in soup(["script", "style", "nav", "header", "footer"]):
-                tag.decompose()
-            job["description"] = soup.get_text(separator="\n", strip=True)[:1200]
-
-    print(f"  [Lancers] {len(jobs)}件")
-    return jobs
+    result = dedupe(jobs)
+    print(f"  [Lancers] {len(result)}件")
+    return result
 
 
-# ─── Crowdworks スクレイピング ─────────────────────────────────────────
-async def scrape_crowdworks(client: httpx.AsyncClient) -> list[dict]:
+# ─── CW: Playwright（ノーログイン） ───────────────────────────────────
+async def scrape_crowdworks(browser) -> list[dict]:
+    page = await browser.new_page()
     jobs = []
-    for i, kw in enumerate(KEYWORDS):
-        url = (
-            f"https://crowdworks.jp/public/jobs/search"
-            f"?order=new_job&keep_search_form=true&keyword={kw}&job_type=fixed_work"
-        )
-        soup = await fetch(client, url, debug=(i == 0))  # 最初の1件だけデバッグ
-        if not soup:
-            continue
 
-        for tag in soup.find_all("a", href=re.compile(r"/public/jobs/\d+")):
-            title = tag.get_text(strip=True)
-            href  = tag.get("href", "")
-            if not title or len(title) < 5:
-                continue
-            if any(x in href for x in ["/search", "/category", "/skill"]):
-                continue
-            job_url = f"https://crowdworks.jp{href}" if href.startswith("/") else href
+    try:
+        for kw in KEYWORDS:
+            url = (
+                f"https://crowdworks.jp/public/jobs/search"
+                f"?order=new_job&keyword={kw}&job_type=fixed_work"
+            )
+            await page.goto(url, timeout=45000)
 
-            parent = tag.find_parent(["li", "article", "div"]) or tag.parent
-            budget = parse_budget(parent.get_text() if parent else "")
+            # JS レンダリング待機
+            try:
+                await page.wait_for_selector(
+                    "a[href*='/public/jobs/offers/'], "
+                    "a[href*='/public/jobs/group_'], "
+                    ".job_offer__name a, "
+                    "h3 a[href*='crowdworks']",
+                    timeout=12000
+                )
+            except Exception:
+                pass  # タイムアウトしても続行
 
-            if budget < MIN_BUDGET:
-                continue
+            # 全リンクから案件URLを抽出
+            links = await page.query_selector_all("a[href*='/public/jobs/']")
+            for link in links[:12]:
+                try:
+                    title   = (await link.inner_text()).strip()
+                    href    = await link.get_attribute("href") or ""
+                    job_url = f"https://crowdworks.jp{href}" if href.startswith("/") else href
 
-            jobs.append({
-                "platform": "クラウドワークス",
-                "title": title,
-                "url": job_url,
-                "budget": budget,
-                "description": "",
-            })
+                    if (
+                        not title or len(title) < 5
+                        or any(x in href for x in ["/search", "/category", "/skill", "/new", "?"])
+                        or not re.search(r"/jobs/\d+|/offers/\d+|/group_", href)
+                    ):
+                        continue
 
-    jobs = dedupe(jobs)
+                    parent = await link.evaluate_handle(
+                        "el => el.closest('li, article, tr, div[class*=job]') || el.parentElement"
+                    )
+                    parent_text = await parent.inner_text() if parent else ""
+                    budget = parse_budget(parent_text)
 
-    for job in jobs[:15]:
-        soup = await fetch(client, job["url"])
-        if soup:
-            for tag in soup(["script", "style", "nav", "header", "footer"]):
-                tag.decompose()
-            job["description"] = soup.get_text(separator="\n", strip=True)[:1200]
+                    if budget < MIN_BUDGET:
+                        continue
 
-    print(f"  [CW] {len(jobs)}件")
-    return jobs
+                    jobs.append({
+                        "platform": "クラウドワークス",
+                        "title": title,
+                        "url": job_url,
+                        "budget": budget,
+                        "description": "",
+                    })
+                except Exception:
+                    continue
+
+        # 詳細取得（上位10件）
+        for job in dedupe(jobs)[:10]:
+            try:
+                await page.goto(job["url"], timeout=20000)
+                await page.wait_for_load_state("domcontentloaded", timeout=10000)
+                body = await page.inner_text("body")
+                job["description"] = body[:1200]
+            except Exception:
+                pass
+
+    except Exception as e:
+        print(f"  [CW error] {e}")
+    finally:
+        await page.close()
+
+    result = dedupe(jobs)
+    print(f"  [CW] {len(result)}件")
+    return result
 
 
 # ─── メイン ───────────────────────────────────────────────────────────
@@ -288,25 +274,31 @@ async def main():
     seen = load_seen()
 
     async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True) as client:
-        lancers_jobs, cw_jobs = await asyncio.gather(
-            scrape_lancers(client),
-            scrape_crowdworks(client),
-        )
-        all_jobs = dedupe(lancers_jobs + cw_jobs)
-        print(f"合計: {len(all_jobs)}件 / 未通知: ", end="")
+        # Lancers (RSS) と CW (Playwright) を並行実行
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            )
+            lancers_jobs, cw_jobs = await asyncio.gather(
+                scrape_lancers(client),
+                scrape_crowdworks(browser),
+            )
+            await browser.close()
 
-        new_jobs = [j for j in all_jobs if j["url"] not in seen]
-        print(f"{len(new_jobs)}件")
+        all_jobs = dedupe(lancers_jobs + cw_jobs)
+        new_jobs  = [j for j in all_jobs if j["url"] not in seen]
+
+        print(f"合計: {len(all_jobs)}件 / 新着: {len(new_jobs)}件")
 
         notified = 0
         for job in new_jobs:
             ev = evaluate(job["title"], job["description"], job["budget"])
             seen.add(job["url"])
-
             if ev.get("score", 0) >= 6:
                 await notify(job, ev, client)
                 notified += 1
-                await asyncio.sleep(1)  # Discord レート制限回避
+                await asyncio.sleep(1)
 
         save_seen(seen)
         print(f"通知: {notified}件 / 完了")
