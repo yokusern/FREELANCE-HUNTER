@@ -141,72 +141,36 @@ def dedupe(jobs: list) -> list:
     return out
 
 
-# ─── Lancers スクレイピング ────────────────────────────────────────────
+# ─── Lancers スクレイピング（ログインなし・公開ページ） ──────────────────
 async def scrape_lancers(browser) -> list[dict]:
-    if not LANCERS_EMAIL:
-        return []
-
     page = await browser.new_page()
     jobs = []
 
     try:
-        # ログイン
-        await page.goto("https://www.lancers.jp/user/login", timeout=60000)
-        await page.wait_for_selector(
-            'input[type="email"], input[name*="email"], input[id*="email"]',
-            timeout=30000
-        )
-        await page.fill(
-            'input[type="email"], input[name*="email"], input[id*="email"]',
-            LANCERS_EMAIL
-        )
-        await page.fill('input[type="password"]', LANCERS_PASSWORD)
-        await page.click('button[type="submit"], input[type="submit"], button:has-text("ログイン")')
-        await page.wait_for_load_state("networkidle", timeout=60000)
-        print("  [Lancers] ログイン完了")
-
         for kw in KEYWORDS:
             url = (
                 f"https://www.lancers.jp/work/search"
                 f"?open=1&sort=new&keyword={kw}&work_type[]=project"
             )
-            await page.goto(url, timeout=30000)
-            await page.wait_for_load_state("networkidle", timeout=30000)
+            await page.goto(url, timeout=60000)
+            await page.wait_for_load_state("domcontentloaded", timeout=30000)
 
-            # 案件カードを取得（複数セレクタ試行）
-            cards = await page.query_selector_all(
-                ".p-search-result__item, .work-item, [class*='search-result-item']"
-            )
-
-            for card in cards[:8]:
+            # ページHTML全体からリンクと金額を抽出
+            links = await page.query_selector_all("a[href*='/work/detail/']")
+            for link in links[:10]:
                 try:
-                    # タイトル & URL
-                    link = await card.query_selector("h3 a, h2 a, a[href*='/work/detail']")
-                    if not link:
-                        continue
-                    title = (await link.inner_text()).strip()
-                    href  = await link.get_attribute("href") or ""
+                    title   = (await link.inner_text()).strip()
+                    href    = await link.get_attribute("href") or ""
                     job_url = f"https://www.lancers.jp{href}" if href.startswith("/") else href
-                    if not job_url:
+                    if not title or not job_url or len(title) < 5:
                         continue
 
-                    # 予算
-                    budget_el = await card.query_selector(
-                        "[class*='price'], [class*='budget'], [class*='reward']"
-                    )
-                    budget = parse_budget(await budget_el.inner_text() if budget_el else "")
+                    # 親要素から予算を探す
+                    parent = await link.evaluate_handle("el => el.closest('li, article, div[class*=item]') || el.parentElement")
+                    parent_text = await parent.inner_text() if parent else ""
+                    budget = parse_budget(parent_text)
 
-                    # 応募者数
-                    app_el = await card.query_selector(
-                        "[class*='proposal'], [class*='applicant'], [class*='offer']"
-                    )
-                    applicants = 999
-                    if app_el:
-                        m = re.search(r"\d+", await app_el.inner_text())
-                        if m:
-                            applicants = int(m.group())
-
-                    if budget < MIN_BUDGET or applicants > MAX_APPLICANTS:
+                    if budget < MIN_BUDGET:
                         continue
 
                     jobs.append({
@@ -214,27 +178,30 @@ async def scrape_lancers(browser) -> list[dict]:
                         "title": title,
                         "url": job_url,
                         "budget": budget,
-                        "applicants": applicants,
+                        "applicants": "不明",
                         "description": "",
                     })
                 except Exception:
                     continue
 
-        # 各案件の詳細説明を取得
-        for job in jobs:
+        # 詳細説明を取得（最大10件）
+        for job in jobs[:10]:
             try:
-                await page.goto(job["url"], timeout=20000)
+                await page.goto(job["url"], timeout=30000)
                 await page.wait_for_load_state("domcontentloaded", timeout=20000)
-                desc_el = await page.query_selector(
-                    "[class*='description'], [class*='detail-body'], .p-job-description"
-                )
-                if desc_el:
-                    job["description"] = (await desc_el.inner_text())[:800]
+                body = await page.inner_text("body")
+                # 説明部分を抽出（最初の800文字）
+                job["description"] = body[:800]
             except Exception:
                 pass
 
+        print(f"  [Lancers] {len(jobs)}件取得")
+
     except Exception as e:
-        await page.screenshot(path="lancers_error.png")
+        try:
+            await page.screenshot(path="lancers_error.png")
+        except Exception:
+            pass
         print(f"  [Lancers error] {e}")
     finally:
         await page.close()
@@ -242,70 +209,36 @@ async def scrape_lancers(browser) -> list[dict]:
     return dedupe(jobs)
 
 
-# ─── Crowdworks スクレイピング ─────────────────────────────────────────
+# ─── Crowdworks スクレイピング（ログインなし・公開ページ） ────────────────
 async def scrape_crowdworks(browser) -> list[dict]:
-    if not CW_EMAIL:
-        return []
-
     page = await browser.new_page()
     jobs = []
 
     try:
-        # ログイン
-        await page.goto("https://crowdworks.jp/login", timeout=60000)
-        await page.wait_for_selector(
-            'input[type="email"], input[name*="email"], input[id*="email"]',
-            timeout=30000
-        )
-        await page.fill(
-            'input[type="email"], input[name*="email"], input[id*="email"]',
-            CW_EMAIL
-        )
-        await page.fill('input[type="password"]', CW_PASSWORD)
-        await page.click('input[type="submit"], button[type="submit"], button:has-text("ログイン")')
-        await page.wait_for_load_state("networkidle", timeout=60000)
-        print("  [CW] ログイン完了")
-
         for kw in KEYWORDS:
             url = (
                 f"https://crowdworks.jp/public/jobs/search"
                 f"?order=new_job&keep_search_form=true&keyword={kw}&job_type=fixed_work"
             )
-            await page.goto(url, timeout=30000)
-            await page.wait_for_load_state("networkidle", timeout=30000)
+            await page.goto(url, timeout=60000)
+            await page.wait_for_load_state("domcontentloaded", timeout=30000)
 
-            cards = await page.query_selector_all(
-                ".job_offer, .job-list-item, [class*='job_offer']"
-            )
-
-            for card in cards[:8]:
+            links = await page.query_selector_all("a[href*='/public/jobs/']")
+            for link in links[:10]:
                 try:
-                    link = await card.query_selector(
-                        "h3 a, h2 a, a[href*='/public/jobs/']"
-                    )
-                    if not link:
-                        continue
                     title   = (await link.inner_text()).strip()
                     href    = await link.get_attribute("href") or ""
                     job_url = f"https://crowdworks.jp{href}" if href.startswith("/") else href
-                    if not job_url:
+                    if not title or not job_url or len(title) < 5:
+                        continue
+                    if "/search" in job_url or "/category" in job_url:
                         continue
 
-                    budget_el = await card.query_selector(
-                        "[class*='reward'], [class*='price'], [class*='budget']"
-                    )
-                    budget = parse_budget(await budget_el.inner_text() if budget_el else "")
+                    parent = await link.evaluate_handle("el => el.closest('li, article, div[class*=job]') || el.parentElement")
+                    parent_text = await parent.inner_text() if parent else ""
+                    budget = parse_budget(parent_text)
 
-                    app_el = await card.query_selector(
-                        "[class*='proposal'], [class*='applicant']"
-                    )
-                    applicants = 999
-                    if app_el:
-                        m = re.search(r"\d+", await app_el.inner_text())
-                        if m:
-                            applicants = int(m.group())
-
-                    if budget < MIN_BUDGET or applicants > MAX_APPLICANTS:
+                    if budget < MIN_BUDGET:
                         continue
 
                     jobs.append({
@@ -313,27 +246,29 @@ async def scrape_crowdworks(browser) -> list[dict]:
                         "title": title,
                         "url": job_url,
                         "budget": budget,
-                        "applicants": applicants,
+                        "applicants": "不明",
                         "description": "",
                     })
                 except Exception:
                     continue
 
-        # 詳細説明取得
-        for job in jobs:
+        # 詳細説明を取得（最大10件）
+        for job in jobs[:10]:
             try:
-                await page.goto(job["url"], timeout=20000)
+                await page.goto(job["url"], timeout=30000)
                 await page.wait_for_load_state("domcontentloaded", timeout=20000)
-                desc_el = await page.query_selector(
-                    ".job_description, [class*='description'], [class*='detail']"
-                )
-                if desc_el:
-                    job["description"] = (await desc_el.inner_text())[:800]
+                body = await page.inner_text("body")
+                job["description"] = body[:800]
             except Exception:
                 pass
 
+        print(f"  [CW] {len(jobs)}件取得")
+
     except Exception as e:
-        await page.screenshot(path="cw_error.png")
+        try:
+            await page.screenshot(path="cw_error.png")
+        except Exception:
+            pass
         print(f"  [CW error] {e}")
     finally:
         await page.close()
